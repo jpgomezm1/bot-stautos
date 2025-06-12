@@ -14,6 +14,7 @@ const { InventoryService } = require('./services/inventoryService');
 const { ElevenLabsService } = require('./services/elevenLabsService');
 const { GCSService } = require('./services/gcsService');
 const { TranscriptionService } = require('./services/transcriptionService');
+const { ImageService } = require('./services/imageService');
 
 const app = express();
 app.use(express.json({ limit: '50mb' }));
@@ -47,6 +48,7 @@ const inventoryService = new InventoryService();
 const elevenLabsService = new ElevenLabsService();
 const gcsService = new GCSService();
 const transcriptionService = new TranscriptionService();
+const imageService = new ImageService();
 
 // Store para conversaciones activas
 const activeConversations = new Map();
@@ -69,6 +71,7 @@ const activeConversations = new Map();
   if (inventoryTest.success) {
     console.log('✅ Inventario de vehículos cargado exitosamente');
     console.log(`📋 Total vehículos: ${inventoryTest.totalVehicles}`);
+    console.log(`🖼️ Vehículos con imágenes: ${inventoryTest.hasImages ? 'Sí' : 'No'}`);
   } else {
     console.log('⚠️ Error cargando inventario:', inventoryTest.error);
   }
@@ -477,10 +480,49 @@ app.post('/webhook', async (req, res) => {
               if (result.success) {
                 const shouldUseAudio = result.response.shouldRespondWithAudio !== false;
                 
-                await sendWhatsAppMessage(phoneNumber, result.response.message, {
-                  messageType: result.response.type === 'appointment_confirmed' ? 'appointment' : 'product_info',
-                  sendAsAudio: shouldUseAudio
-                });
+                // Manejar envío de imágenes
+                if (result.response.type === 'send_images') {
+                  // Primero enviar el mensaje de texto
+                  await sendWhatsAppMessage(phoneNumber, result.response.message, {
+                    messageType: 'product_info',
+                    sendAsAudio: shouldUseAudio
+                  });
+                  
+                  // Luego enviar imágenes si hay referencia de vehículo
+                  if (result.response.vehicleReference) {
+                    const vehicle = await inventoryService.getVehicleByReference(result.response.vehicleReference);
+                    if (vehicle && vehicle.ImagenesArray) {
+                      const imageResult = await imageService.sendVehicleImages(phoneNumber, vehicle, 3);
+                      if (imageResult.success) {
+                        console.log(`📸 ${imageResult.totalSent} imágenes enviadas del ${vehicle.Marca} ${vehicle.Modelo}`);
+                      } else {
+                        // Si falla el envío de imágenes, informar al usuario
+                        await sendWhatsAppMessage(phoneNumber, "Uy, tuve problemas enviando las fotos. ¿Te parece si me escribes y te cuento más detalles?", {
+                          messageType: 'error',
+                          sendAsAudio: false
+                        });
+                      }
+                    } else {
+                      // Si no hay referencia específica, preguntar cuál vehículo
+                      await sendWhatsAppMessage(phoneNumber, "¿De cuál vehículo quieres ver las fotos? Pásame la referencia.", {
+                        messageType: 'consultation',
+                        sendAsAudio: shouldUseAudio
+                      });
+                    }
+                  } else {
+                    // Si no hay referencia específica, preguntar cuál vehículo
+                    await sendWhatsAppMessage(phoneNumber, "¿De cuál vehículo quieres ver las fotos? Pásame la referencia.", {
+                      messageType: 'consultation',
+                      sendAsAudio: shouldUseAudio
+                    });
+                  }
+                } else {
+                  // Manejo normal de otros tipos de respuesta
+                  await sendWhatsAppMessage(phoneNumber, result.response.message, {
+                    messageType: result.response.type === 'appointment_confirmed' ? 'appointment' : 'product_info',
+                    sendAsAudio: shouldUseAudio
+                  });
+                }
                 
                 if (result.response.type === 'appointment_confirmed') {
                   console.log(`🎉 ¡CITA AGENDADA! ${phoneNumber}`);
@@ -570,16 +612,10 @@ app.post('/start-conversation', async (req, res) => {
     // Obtener inventario para mensaje personalizado
     const inventory = await inventoryService.getInventory();
     
-    // Mensaje inicial más natural y personalizado
+    // Mensaje inicial más natural y personalizado (CORTO)
     const initialMessage = `¡Ey! ¿Qué tal? Soy Carlos del concesionario 👋
 
-Me da mucho gusto saludarte. Veo que andas buscando carro, ¿cierto? Pues llegaste al lugar indicado porque tenemos unas opciones que te van a encantar.
-
-Te cuento que tenemos más de ${inventory.success ? inventory.vehicles.length : '50'} vehículos en el lote, de todas las marcas: Toyota, Chevrolet, Nissan, Ford, y muchas más.
-
-¿Qué te parece si me cuentas qué tipo de carro andas buscando? ¿Es para la familia, para el trabajo, o qué tienes en mente? 
-
-Acá relajado conversamos y encontramos algo que te guste y que esté dentro de tu presupuesto 😊`;
+¿Andas buscando carro?`;
 
     await sendWhatsAppMessage(normalizedPhone, initialMessage, { 
       messageType: 'greeting',
@@ -645,7 +681,10 @@ app.get('/inventory', async (req, res) => {
         vehicles: inventory.vehicles,
         total: inventory.vehicles.length,
         brands: inventory.brands,
-        models: inventory.models
+        models: inventory.models,
+        types: inventory.types,
+        colors: inventory.colors,
+        transmissions: inventory.transmissions
       });
     } else {
       res.status(500).json({
@@ -699,10 +738,10 @@ app.delete('/admin/clear-data/:phone', async (req, res) => {
     console.error('Error limpiando datos:', error);
     res.status(500).json({ error: 'Error limpiando datos' });
   }
-});
-
-// Endpoint para probar inventario
-app.get('/admin/test-inventory', async (req, res) => {
+ });
+ 
+ // Endpoint para probar inventario
+ app.get('/admin/test-inventory', async (req, res) => {
   try {
     console.log('🧪 Probando conexión con inventario...');
     
@@ -713,6 +752,8 @@ app.get('/admin/test-inventory', async (req, res) => {
       message: testResult.success ? 'Inventario cargado exitosamente' : 'Error cargando inventario',
       totalVehicles: testResult.totalVehicles || 0,
       brands: testResult.brands || [],
+      types: testResult.types || [],
+      hasImages: testResult.hasImages || false,
       error: testResult.error || null
     });
     
@@ -720,30 +761,30 @@ app.get('/admin/test-inventory', async (req, res) => {
     console.error('Error probando inventario:', error);
     res.status(500).json({ error: 'Error probando inventario' });
   }
-});
-
-// Endpoint para probar GCS
-app.get('/admin/test-gcs', async (req, res) => {
+ });
+ 
+ // Endpoint para probar GCS
+ app.get('/admin/test-gcs', async (req, res) => {
   try {
     const testResult = await gcsService.testConnection();
     res.json(testResult);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
-});
-
-// Endpoint para listar audios en GCS
-app.get('/admin/gcs-audios', async (req, res) => {
+ });
+ 
+ // Endpoint para listar audios en GCS
+ app.get('/admin/gcs-audios', async (req, res) => {
   try {
     const result = await gcsService.listAudios();
     res.json(result);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
-});
-
-// Endpoint para limpiar audios antiguos
-app.post('/admin/clean-gcs-audios', async (req, res) => {
+ });
+ 
+ // Endpoint para limpiar audios antiguos
+ app.post('/admin/clean-gcs-audios', async (req, res) => {
   try {
     const { maxAgeHours = 24 } = req.body;
     const result = await gcsService.cleanOldAudios(maxAgeHours);
@@ -751,10 +792,10 @@ app.post('/admin/clean-gcs-audios', async (req, res) => {
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
-});
-
-// Endpoint para ajustar configuración de voz
-app.post('/admin/voice-config', async (req, res) => {
+ });
+ 
+ // Endpoint para ajustar configuración de voz
+ app.post('/admin/voice-config', async (req, res) => {
   try {
     const { voiceId, stability, similarity_boost, style } = req.body;
     
@@ -780,10 +821,10 @@ app.post('/admin/voice-config', async (req, res) => {
  } catch (error) {
    res.status(500).json({ error: error.message });
  }
-});
-
-// Endpoint para probar calidad de voz
-app.post('/admin/test-voice', async (req, res) => {
+ });
+ 
+ // Endpoint para probar calidad de voz
+ app.post('/admin/test-voice', async (req, res) => {
  try {
    const { text, messageType } = req.body;
    
@@ -819,10 +860,10 @@ app.post('/admin/test-voice', async (req, res) => {
  } catch (error) {
    res.status(500).json({ error: error.message });
  }
-});
-
-// Endpoint para obtener configuración actual de voz
-app.get('/admin/voice-config', (req, res) => {
+ });
+ 
+ // Endpoint para obtener configuración actual de voz
+ app.get('/admin/voice-config', (req, res) => {
  try {
    res.json({
      success: true,
@@ -840,10 +881,55 @@ app.get('/admin/voice-config', (req, res) => {
  } catch (error) {
    res.status(500).json({ error: error.message });
  }
-});
-
-// Endpoint para ver conversaciones activas
-app.get('/conversations', (req, res) => {
+ });
+ 
+ // Endpoint para probar envío de imágenes
+ app.post('/admin/test-images', async (req, res) => {
+  try {
+    const { phoneNumber, vehicleReference } = req.body;
+    
+    if (!phoneNumber) {
+      return res.status(400).json({ error: 'Número de teléfono requerido' });
+    }
+    
+    const normalizedPhone = formatPhoneNumber(phoneNumber);
+    
+    if (vehicleReference) {
+      // Probar con vehículo específico
+      const vehicle = await inventoryService.getVehicleByReference(vehicleReference);
+      if (!vehicle) {
+        return res.status(404).json({ error: 'Vehículo no encontrado' });
+      }
+      
+      const result = await imageService.sendVehicleImages(normalizedPhone, vehicle);
+      res.json({
+        success: result.success,
+        message: `${result.totalSent || 0} imágenes enviadas`,
+        vehicle: {
+          referencia: vehicle.Referencia_Vehiculo,
+          marca: vehicle.Marca,
+          modelo: vehicle.Modelo
+        },
+        result: result
+      });
+    } else {
+      // Prueba con imagen de demo
+      const result = await imageService.testImageSend(normalizedPhone);
+      res.json({
+        success: result.success,
+        message: 'Imagen de prueba enviada',
+        result: result
+      });
+    }
+    
+  } catch (error) {
+    console.error('Error probando imágenes:', error);
+    res.status(500).json({ error: 'Error probando imágenes' });
+  }
+ });
+ 
+ // Endpoint para ver conversaciones activas
+ app.get('/conversations', (req, res) => {
  const conversations = [];
  activeConversations.forEach((conv, phone) => {
    conversations.push({
@@ -860,10 +946,10 @@ app.get('/conversations', (req, res) => {
    total: conversations.length,
    authorizedNumbers: AUTHORIZED_NUMBERS
  });
-});
-
-// Endpoint para estadísticas del sistema
-app.get('/stats', async (req, res) => {
+ });
+ 
+ // Endpoint para estadísticas del sistema
+ app.get('/stats', async (req, res) => {
  try {
    const leads = await vehicleDB.getAll();
    const inventory = await inventoryService.getInventory();
@@ -889,8 +975,10 @@ app.get('/stats', async (req, res) => {
    const inventoryStats = inventory.success ? {
      totalVehicles: inventory.vehicles.length,
      brands: inventory.brands.length,
+     types: inventory.types ? inventory.types.length : 0,
+     withImages: inventory.vehicles.filter(v => v.ImagenesArray && v.ImagenesArray.length > 0).length,
      lastUpdate: inventory.lastUpdate
-   } : { totalVehicles: 0, brands: 0, lastUpdate: null };
+   } : { totalVehicles: 0, brands: 0, types: 0, withImages: 0, lastUpdate: null };
    
    // Estadísticas de mensajes de audio vs texto
    const audioStats = {
@@ -912,10 +1000,10 @@ app.get('/stats', async (req, res) => {
    console.error('Error obteniendo estadísticas:', error);
    res.status(500).json({ error: 'Error obteniendo estadísticas' });
  }
-});
-
-// Health check
-app.get('/health', async (req, res) => {
+ });
+ 
+ // Health check
+ app.get('/health', async (req, res) => {
  try {
    const dbHealth = await vehicleDB.healthCheck();
    const inventoryHealth = await inventoryService.testConnection();
@@ -930,7 +1018,8 @@ app.get('/health', async (req, res) => {
      inventory: {
        configured: true,
        loaded: inventoryHealth.success,
-       totalVehicles: inventoryHealth.totalVehicles || 0
+       totalVehicles: inventoryHealth.totalVehicles || 0,
+       hasImages: inventoryHealth.hasImages || false
      },
      email: {
        configured: !!(process.env.RESEND_API_KEY && process.env.DOMAIN),
@@ -959,6 +1048,10 @@ app.get('/health', async (req, res) => {
      transcription: {
        configured: !!process.env.OPENAI_API_KEY,
        ready: !!process.env.OPENAI_API_KEY
+     },
+     images: {
+       configured: !!(process.env.ULTRAMSG_TOKEN && process.env.INSTANCE_ID),
+       ready: !!(process.env.ULTRAMSG_TOKEN && process.env.INSTANCE_ID)
      }
    };
    
@@ -973,7 +1066,7 @@ app.get('/health', async (req, res) => {
      authorizedNumbers: AUTHORIZED_NUMBERS,
      environment: process.env.NODE_ENV || 'development',
      services: services,
-     version: '2.0-natural-voice-enhanced'
+     version: '2.1-enhanced-images'
    });
  } catch (error) {
    console.error('Error en health check:', error);
@@ -983,10 +1076,10 @@ app.get('/health', async (req, res) => {
      timestamp: new Date().toISOString()
    });
  }
-});
-
-// Endpoint para análisis de tono de mensajes
-app.post('/admin/analyze-tone', (req, res) => {
+ });
+ 
+ // Endpoint para análisis de tono de mensajes
+ app.post('/admin/analyze-tone', (req, res) => {
  try {
    const { message } = req.body;
    
@@ -1014,19 +1107,64 @@ app.post('/admin/analyze-tone', (req, res) => {
  } catch (error) {
    res.status(500).json({ error: error.message });
  }
-});
-
-// Limpiar archivos antiguos de GCS cada 6 horas
-setInterval(async () => {
+ });
+ 
+ // Endpoint para obtener detalles de vehículo con imágenes
+ app.get('/vehicle/:reference', async (req, res) => {
+  try {
+    const { reference } = req.params;
+    const vehicleDetails = await inventoryService.getVehicleDetails(reference);
+    
+    if (vehicleDetails.success) {
+      res.json({
+        success: true,
+        vehicle: vehicleDetails.vehicle
+      });
+    } else {
+      res.status(404).json({
+        success: false,
+        error: vehicleDetails.message || 'Vehículo no encontrado'
+      });
+    }
+  } catch (error) {
+    console.error('Error obteniendo detalles del vehículo:', error);
+    res.status(500).json({ error: 'Error obteniendo detalles del vehículo' });
+  }
+ });
+ 
+ // Endpoint para estadísticas avanzadas del inventario
+ app.get('/inventory/stats', async (req, res) => {
+  try {
+    const stats = await inventoryService.getInventoryStats();
+    
+    if (stats.success) {
+      res.json({
+        success: true,
+        stats: stats.stats
+      });
+    } else {
+      res.status(500).json({
+        success: false,
+        error: stats.error
+      });
+    }
+  } catch (error) {
+    console.error('Error obteniendo estadísticas del inventario:', error);
+    res.status(500).json({ error: 'Error obteniendo estadísticas del inventario' });
+  }
+ });
+ 
+ // Limpiar archivos antiguos de GCS cada 6 horas
+ setInterval(async () => {
  try {
    await gcsService.cleanOldAudios(6); // Eliminar archivos mayores a 6 horas
  } catch (error) {
    console.error('Error limpiando archivos antiguos de GCS:', error);
  }
-}, 6 * 60 * 60 * 1000);
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+ }, 6 * 60 * 60 * 1000);
+ 
+ const PORT = process.env.PORT || 3000;
+ app.listen(PORT, () => {
  console.log('\n' + '='.repeat(60));
  console.log('🚗 BOT CONCESIONARIO INICIADO EXITOSAMENTE');
  console.log('='.repeat(60));
@@ -1054,7 +1192,12 @@ app.listen(PORT, () => {
  console.log(`🎤 Probar voz: POST ${PORT}/admin/test-voice`);
  console.log(`🎭 Analizar tono: POST ${PORT}/admin/analyze-tone`);
  console.log('');
- console.log('🎯 BOT PARA COMPRA-VENTA DE VEHÍCULOS v2.0-VOICE-ENHANCED');
+ console.log('📸 ENDPOINTS DE IMÁGENES:');
+ console.log(`🖼️ Probar imágenes: POST ${PORT}/admin/test-images`);
+ console.log(`🚗 Detalles vehículo: GET ${PORT}/vehicle/{reference}`);
+ console.log(`📊 Stats inventario: GET ${PORT}/inventory/stats`);
+ console.log('');
+ console.log('🎯 BOT PARA COMPRA-VENTA DE VEHÍCULOS v2.1-IMAGES-ENHANCED');
  console.log('💡 Funcionalidades:');
  console.log('   🗣️ Conversaciones súper naturales con Carlos');
  console.log('   📋 Consulta de inventario desde Google Sheets');
@@ -1071,8 +1214,12 @@ app.listen(PORT, () => {
  console.log('   🎭 Análisis de tono automático para voz natural');
  console.log('   🎛️ Configuración dinámica de parámetros de voz');
  console.log('   🔊 Respuesta en mismo formato (audio por audio)');
+ console.log('   📸 Envío automático de imágenes de vehículos');
+ console.log('   🖼️ Soporte para múltiples imágenes por vehículo');
+ console.log('   🎯 Detección inteligente de solicitudes de imágenes');
+ console.log('   📝 Captions personalizados para cada imagen');
  console.log('='.repeat(60));
- console.log('🎉 ¡Listo para conversaciones naturales con audio bidireccional mejorado!');
+ console.log('🎉 ¡Listo para conversaciones naturales con audio e imágenes!');
  console.log('='.repeat(60) + '\n');
  
  // Mostrar configuración actual de voz
@@ -1094,5 +1241,9 @@ app.listen(PORT, () => {
  console.log('   • error - Mensajes de error calmados');
  console.log('   • enthusiasm - Momentos de emoción');
  console.log('   • consultation - Consultas técnicas');
+ console.log('');
+ console.log('📸 COMANDOS DE PRUEBA PARA IMÁGENES:');
+ console.log(`   curl -X POST ${PORT}/admin/test-images -H "Content-Type: application/json" -d '{"phoneNumber": "3183351733"}'`);
+ console.log(`   curl -X POST ${PORT}/admin/test-images -H "Content-Type: application/json" -d '{"phoneNumber": "3183351733", "vehicleReference": "VEH001"}'`);
  console.log('='.repeat(60) + '\n');
-});
+ });

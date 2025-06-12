@@ -22,12 +22,12 @@ class VehicleConversationEngine {
     } catch (error) {
       console.error('Error procesando con Claude:', error);
       
-      // Respuestas de error más naturales
+      // Respuestas de error más naturales y cortas
       const errorResponses = [
-        "Uy, se me trabó el sistema un momentito 😅 ¿Me puedes repetir lo que me dijiste?",
-        "Perdón, parece que se me cortó la conexión. ¿Qué me estabas diciendo?",
-        "Ay no, mi internet está haciendo de las suyas. ¿Podrías decirme de nuevo qué necesitas?",
-        "Disculpa, tuve un pequeño problema técnico. ¿Me repites por favor?"
+        "Se me trabó un momentito 😅 ¿Me repites?",
+        "Perdón, ¿qué me decías?",
+        "No te escuché bien, ¿me dices de nuevo?",
+        "Disculpa, ¿puedes repetir?"
       ];
       
       return {
@@ -63,16 +63,27 @@ class VehicleConversationEngine {
   }
   
   async getClaudeResponse(userMessage, context, leadData) {
-    const systemPrompt = `Eres Carlos, un vendedor colombiano de carros usados con más de 15 años de experiencia. Eres súper natural, carismático, confiable y tienes mucha labia para vender, pero de manera auténtica y honesta.
+    const systemPrompt = `Eres Carlos, un vendedor de carros colombiano súper natural y relajado. 
+
+REGLAS CRÍTICAS:
+- Responde MÁXIMO 2-3 líneas por mensaje
+- Haz UNA sola pregunta por vez
+- Habla como si fueras un parcero, no un robot
+- No uses listas largas ni bullet points
+- Mantén el momentum de la conversación
+- NUNCA repitas información que ya diste
+
+DETECCIÓN DE SOLICITUDES DE IMÁGENES:
+- Si mencionan "fotos", "imágenes", "ver", "mostrar", "cómo se ve", "apariencia", detecta como solicitud de imagen
+- Si preguntan por un vehículo específico + quieren verlo, ofrecer imágenes
+- Responder con tipo "send_images" cuando detectes solicitud de imágenes
+- Si mencionan una referencia específica (VEH001, VEH002, etc.) + solicitud visual, incluir "vehicle_reference"
 
 Tu personalidad:
-- Hablas como un colombiano real, usando expresiones naturales
-- Eres cálido, amigable pero profesional  
-- Te gusta hacer sentir al cliente como si fuera tu parcero
-- Usas humor sutil y referencias colombianas cuando es apropiado
-- No suenas robótico ni demasiado formal
-- Siempre estás dispuesto a negociar y encontrar la mejor opción para el cliente
-- Conoces muy bien los carros y das consejos útiles
+- Relajado y amigable como un amigo
+- Usas expresiones colombianas naturales pero sin exagerar
+- Directo pero cálido
+- Te enfocas en UNA cosa a la vez
 
 INFORMACIÓN DEL CLIENTE:
 - Teléfono: ${context.clienteInfo.telefono}
@@ -83,76 +94,69 @@ ${JSON.stringify(context.interesActual, null, 2)}
 
 INVENTARIO DISPONIBLE:
 ${context.inventarioDisponible ? `
-Total vehículos en el lote: ${context.inventarioDisponible.total}
-Marcas que tenemos: ${context.inventarioDisponible.marcas.join(', ')}
+Total vehículos: ${context.inventarioDisponible.total}
+Marcas disponibles: ${context.inventarioDisponible.marcas.slice(0, 8).join(', ')}
 
-CARROS DISPONIBLES (primeros 15):
-${context.inventarioDisponible.vehiculos.slice(0, 15).map(v => 
-  `- ${v.Marca} ${v.Modelo} (${v.KM} km) - Ref: ${v.Referencia_Vehiculo}`
+VEHÍCULOS (primeros 8):
+${context.inventarioDisponible.vehiculos.slice(0, 8).map(v => 
+  `${v.Referencia_Vehiculo}: ${v.Marca} ${v.Modelo} ${v.Año || ''} (${v.KM || v.Kilometraje} km)${v.Precio ? ' - $' + v.Precio : ''}`
 ).join('\n')}
-` : 'Inventario no disponible temporalmente'}
+` : 'Inventario no disponible'}
 
 STEP ACTUAL: ${context.stepActual}
 
-CONTEXTO DE CONVERSACIÓN PREVIA:
+CONVERSACIÓN RECIENTE:
 ${context.conversacionPrevia.length > 0 ? 
-  context.conversacionPrevia.slice(-3).map(conv => 
+  context.conversacionPrevia.slice(-2).map(conv => 
     `Usuario: ${conv.user_message}\nCarlos: ${conv.bot_response}`
   ).join('\n\n') : 
-  'Primera interacción con el cliente'
+  'Primera interacción'
 }
 
-INSTRUCCIONES PARA RESPONDER:
-1. Responde como Carlos, el vendedor carismático
-2. Sé conversacional y natural - como si fueras un amigo recomendando carros
-3. No uses listas con viñetas (•) ni formatos robóticos
-4. Habla de los carros con pasión y conocimiento
-5. Cuando muestres opciones, hazlo de manera fluida en párrafos naturales
-6. Usa expresiones colombianas naturales pero no exageres
-7. Pregunta cosas relevantes para entender mejor qué necesita
-8. Si no sabes algo específico del inventario, sé honesto pero optimista
-9. Mantén la conversación fluyendo hacia agendar una cita
-10. Usa emojis con moderación y de manera natural
-11. SIEMPRE responde en JSON válido
-12. Ten en cuenta la conversación previa para mantener continuidad
-13. Si el cliente repite algo, no actúes como si fuera la primera vez
+EJEMPLOS DE DETECCIÓN DE IMÁGENES:
+- "¿Puedes mostrarme fotos del Toyota?" → next_action: "send_images", image_request: true
+- "Quiero ver cómo se ve el VEH001" → next_action: "send_images", vehicle_reference: "VEH001", image_request: true
+- "¿Tienes imágenes de ese carro?" → next_action: "send_images", image_request: true
+- "Me gustaría ver el interior" → next_action: "send_images", image_request: true
 
-EJEMPLOS DE CÓMO HABLAR:
-- "¡Ey! Qué tal, me da mucho gusto saludarte"
-- "Mira, te tengo unas opciones que te van a encantar"
-- "Te cuento que ese carro es una belleza"
-- "¿Sabes qué? Tengo algo perfecto para ti"
-- "Ese sí está divino, yo mismo lo probaría"
-- "Tranquilo, acá encontramos lo que necesitas"
-- "Dale pues, vamos viendo qué opciones hay"
-- "¡Qué más parcero! Me alegra que me escribas"
+FLUJO NATURAL:
+1. Saludo súper corto
+2. Una pregunta simple 
+3. Escuchar respuesta
+4. Hacer siguiente pregunta según respuesta
+5. Mostrar máximo 2-3 opciones específicas
+6. Si piden imágenes, confirmar y enviar
 
-PROCESO DE VENTA NATURAL:
-- Saludo cálido y genuino
-- Entender qué busca realmente (no solo tipo, sino uso, familia, etc.)
-- Mostrar opciones que realmente le convengan
-- Contar historias breves sobre los carros si es apropiado
-- Generar confianza hablando de garantías, revisiones, etc.
-- Invitar a ver el carro cuando haya interés genuino
+PATRONES DE RESPUESTA:
+- Saludo inicial: "¡Ey! ¿Qué tal? Soy Carlos 👋 ¿Andas buscando carro?"
+- Pregunta marca: "¿Qué marca te gusta más?"
+- Mostrar opción: "Tengo un Toyota RAV4 que está divino. ¿Te interesa?"
+- Presupuesto: "¿En qué rango de precio andas pensando?"
+- Agendar: "¿Cuándo podrías venir a verlo?"
+- Imágenes: "¡Claro! Te mando las fotos del [vehículo]"
 
-RESPONDE ESTRICTAMENTE EN ESTE FORMATO JSON (sin texto adicional antes o después):
+RESPONDE ESTRICTAMENTE EN ESTE JSON:
 {
-  "message": "tu respuesta súper natural como Carlos",
+  "message": "respuesta súper corta y natural (máximo 150 caracteres)",
   "extracted_data": {},
-  "next_action": "mostrar_vehiculos|agendar_cita|confirmar_cita|continuar_consulta",
+  "next_action": "mostrar_vehiculos|agendar_cita|confirmar_cita|send_images|continuar_consulta",
   "waiting_for": "paso_siguiente",
   "vehiculos_mostrados": [],
-  "appointment_date": null
+  "appointment_date": null,
+  "vehicle_reference": null,
+  "image_request": false
 }`;
 
     const userPrompt = `El cliente dice: "${userMessage}"
 
-Responde como Carlos, el vendedor natural y carismático. Mantén la continuidad de la conversación previa y construye sobre lo que ya han hablado.`;
+Responde como Carlos de manera súper natural y corta. Mantén la continuidad pero NO repitas lo que ya dijiste antes.
+
+IMPORTANTE: Si detectas solicitud de imágenes, marca image_request: true y next_action: "send_images". Si mencionan referencia específica de vehículo, incluye vehicle_reference.`;
 
     try {
       const response = await this.anthropic.messages.create({
         model: "claude-3-5-sonnet-20241022",
-        max_tokens: 1500,
+        max_tokens: 800,
         temperature: 0.8,
         system: systemPrompt,
         messages: [{ role: "user", content: userPrompt }]
@@ -177,15 +181,22 @@ Responde como Carlos, el vendedor natural y carismático. Mantén la continuidad
         console.error('Error parseando JSON de Claude:', parseError);
         console.error('Respuesta recibida:', responseText);
         
-        // Crear respuesta de fallback
+        // Crear respuesta de fallback corta
         claudeResponse = {
-          message: "Disculpa, tuve un pequeño problema técnico. ¿Me repites por favor?",
+          message: "No te escuché bien, ¿me repites?",
           extracted_data: {},
           next_action: "continuar_consulta",
           waiting_for: "consulta_general",
           vehiculos_mostrados: [],
-          appointment_date: null
+          appointment_date: null,
+          vehicle_reference: null,
+          image_request: false
         };
+      }
+
+      // Validar longitud del mensaje
+      if (claudeResponse.message && claudeResponse.message.length > 200) {
+        claudeResponse.message = this.shortenMessage(claudeResponse.message);
       }
       
       // Procesar la respuesta de Claude
@@ -193,18 +204,40 @@ Responde como Carlos, el vendedor natural y carismático. Mantén la continuidad
       
     } catch (error) {
       console.error('Error con Claude:', error);
-      console.error('Respuesta completa:', response?.content?.[0]?.text);
       throw error;
     }
   }
   
+  shortenMessage(longMessage) {
+    const sentences = longMessage.split('. ');
+    
+    // Si es muy largo, usar solo la primera oración + una pregunta
+    if (longMessage.length > 200) {
+      const firstSentence = sentences[0];
+      const hasQuestion = longMessage.includes('?');
+      
+      if (hasQuestion) {
+        // Encontrar la pregunta más corta
+        const questions = longMessage.split('?').filter(q => q.trim());
+        const shortestQuestion = questions.reduce((a, b) => a.length <= b.length ? a : b);
+        return `${firstSentence}. ${shortestQuestion.trim()}?`;
+      } else {
+        return `${firstSentence}. ¿Qué opinas?`;
+      }
+    }
+    
+    return longMessage;
+  }
+  
   processClaudeResponse(claudeResponse, leadData) {
-    const { message, extracted_data, next_action, waiting_for, vehiculos_mostrados, appointment_date } = claudeResponse;
+    const { message, extracted_data, next_action, waiting_for, vehiculos_mostrados, appointment_date, vehicle_reference, image_request } = claudeResponse;
     
     // Determinar el tipo de respuesta
     let responseType = 'consultation';
     
-    if (next_action === 'agendar_cita') {
+    if (next_action === 'send_images' || image_request) {
+      responseType = 'send_images';
+    } else if (next_action === 'agendar_cita') {
       responseType = 'schedule_appointment';
     } else if (next_action === 'confirmar_cita' && appointment_date) {
       responseType = 'appointment_confirmed';
@@ -222,9 +255,9 @@ Responde como Carlos, el vendedor natural y carismático. Mantén la continuidad
       was_audio: leadData.lastMessageWasAudio || false
     });
     
-    // Guardar solo los últimos 15 intercambios para no sobrecargar
-    if (conversationHistory.length > 15) {
-      conversationHistory.splice(0, conversationHistory.length - 15);
+    // Guardar solo los últimos 10 intercambios para mantener conversaciones cortas
+    if (conversationHistory.length > 10) {
+      conversationHistory.splice(0, conversationHistory.length - 10);
     }
     
     // Extraer información adicional del mensaje del usuario si es relevante
@@ -241,7 +274,8 @@ Responde como Carlos, el vendedor natural y carismático. Mantén la continuidad
       },
       vehiculosMostrados: vehiculos_mostrados || [],
       appointmentDate: appointment_date,
-      shouldRespondWithAudio: leadData.lastMessageWasAudio // Mantener el formato del usuario
+      vehicleReference: vehicle_reference,
+      shouldRespondWithAudio: leadData.lastMessageWasAudio
     };
   }
   
@@ -276,43 +310,43 @@ Responde como Carlos, el vendedor natural y carismático. Mantén la continuidad
     
     // Extraer presupuesto aproximado
     const budgetMatch = userMessage.match(/(\d+)\s*(millones?|mill)/i);
-    if (budgetMatch && !additionalData.presupuesto_max) {
-      const amount = parseInt(budgetMatch[1]) * 1000000;
-      additionalData.presupuesto_max = amount;
-    }
-    
-    // Detectar uso del vehículo
-    const usagePatterns = {
-      'trabajo': 'Trabajo',
-      'familia': 'Familiar',
-      'finca': 'Campo/Finca',
-      'cargar': 'Carga',
-      'personal': 'Personal'
-    };
-    
-    for (const [key, value] of Object.entries(usagePatterns)) {
-      if (lowerMessage.includes(key) && !additionalData.uso_vehiculo) {
-        additionalData.uso_vehiculo = value;
-        break;
-      }
-    }
-    
-    // Detectar referencias específicas de vehículos
-    const refMatch = userMessage.match(/VEH\d+|REF[\-\s]*\d+/gi);
-    if (refMatch && !additionalData.vehiculo_consultado) {
-      additionalData.vehiculo_consultado = refMatch[0];
-      
-      if (!additionalData.vehiculos_consultados) {
-        additionalData.vehiculos_consultados = [];
-      }
-      
-      if (!additionalData.vehiculos_consultados.includes(refMatch[0])) {
-        additionalData.vehiculos_consultados.push(refMatch[0]);
-      }
-    }
-    
-    return additionalData;
-  }
+   if (budgetMatch && !additionalData.presupuesto_max) {
+     const amount = parseInt(budgetMatch[1]) * 1000000;
+     additionalData.presupuesto_max = amount;
+   }
+   
+   // Detectar uso del vehículo
+   const usagePatterns = {
+     'trabajo': 'Trabajo',
+     'familia': 'Familiar',
+     'finca': 'Campo/Finca',
+     'cargar': 'Carga',
+     'personal': 'Personal'
+   };
+   
+   for (const [key, value] of Object.entries(usagePatterns)) {
+     if (lowerMessage.includes(key) && !additionalData.uso_vehiculo) {
+       additionalData.uso_vehiculo = value;
+       break;
+     }
+   }
+   
+   // Detectar referencias específicas de vehículos
+   const refMatch = userMessage.match(/VEH\d+|REF[\-\s]*\d+/gi);
+   if (refMatch && !additionalData.vehiculo_consultado) {
+     additionalData.vehiculo_consultado = refMatch[0];
+     
+     if (!additionalData.vehiculos_consultados) {
+       additionalData.vehiculos_consultados = [];
+     }
+     
+     if (!additionalData.vehiculos_consultados.includes(refMatch[0])) {
+       additionalData.vehiculos_consultados.push(refMatch[0]);
+     }
+   }
+   
+   return additionalData;
+ }
 }
 
 module.exports = { VehicleConversationEngine };
