@@ -1,7 +1,7 @@
 // test-vehicle-bot.js
 const axios = require('axios');
 
-const NGROK_URL = 'https://abd3c260797c.ngrok.app'; // Actualiza con tu URL
+const NGROK_URL = 'https://1b31e3c1068f.ngrok.app'; // Actualiza con tu URL
 const AUTHORIZED_NUMBER = '3183351733'; // SIN 57
 
 async function testVehicleBot() {

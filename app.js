@@ -13,6 +13,7 @@ const { VehicleSheetsService } = require('./services/vehicleSheetsService');
 const { InventoryService } = require('./services/inventoryService');
 const { ElevenLabsService } = require('./services/elevenLabsService');
 const { GCSService } = require('./services/gcsService');
+const { TranscriptionService } = require('./services/transcriptionService');
 
 const app = express();
 app.use(express.json({ limit: '50mb' }));
@@ -45,6 +46,7 @@ const vehicleSheetsService = new VehicleSheetsService();
 const inventoryService = new InventoryService();
 const elevenLabsService = new ElevenLabsService();
 const gcsService = new GCSService();
+const transcriptionService = new TranscriptionService();
 
 // Store para conversaciones activas
 const activeConversations = new Map();
@@ -156,7 +158,7 @@ async function sendWhatsAppAudioByUrl(to, audioUrl) {
   }
 }
 
-// Función para enviar mensaje por WhatsApp (actualizada para usar GCS)
+// Función para enviar mensaje por WhatsApp (actualizada para usar análisis de tono)
 async function sendWhatsAppMessage(to, message, options = {}) {
   try {
     const sendAsAudio = options.sendAsAudio !== false && process.env.ENABLE_AUDIO_MESSAGES === 'true';
@@ -164,7 +166,12 @@ async function sendWhatsAppMessage(to, message, options = {}) {
     if (sendAsAudio) {
       console.log(`🎙️ Generando audio para ${to}...`);
       
-      const voiceConfig = elevenLabsService.getVoiceForMessageType(options.messageType || 'general');
+      // Analizar el tono del mensaje para configuración óptima
+      const analyzedTone = elevenLabsService.analyzeMessageTone(message);
+      const voiceConfig = elevenLabsService.getVoiceForMessageType(analyzedTone);
+      
+      console.log(`🎭 Tono detectado: ${analyzedTone}`);
+      
       const audioResult = await elevenLabsService.textToSpeech(message, voiceConfig);
       
       if (audioResult.success && audioResult.publicUrl) {
@@ -231,9 +238,35 @@ async function sendWhatsAppMessage(to, message, options = {}) {
 }
 
 // Función para procesar mensajes del usuario
-async function processUserMessage(phoneNumber, message) {
+async function processUserMessage(phoneNumber, message, options = {}) {
   try {
-    logConversation(phoneNumber, message, 'user');
+    const { isAudioMessage = false, mediaUrl = null } = options;
+    
+    let finalMessage = message;
+    
+    // Si es mensaje de audio, transcribir primero
+    if (isAudioMessage && mediaUrl) {
+      console.log('🎤 Procesando mensaje de audio...');
+      const transcription = await transcriptionService.transcribeAudio(mediaUrl);
+      
+      if (transcription.success) {
+        finalMessage = transcription.text;
+        console.log(`📝 Audio transcrito: "${finalMessage}"`);
+      } else {
+        // Si falla la transcripción, responder pidiendo texto
+        return {
+          success: true,
+          response: {
+            type: 'transcription_error',
+            message: transcription.fallbackMessage || 'No pude entender el audio, ¿puedes escribirme qué necesitas?',
+            waitingFor: 'consulta_general',
+            shouldRespondWithAudio: false // Forzar respuesta en texto
+          }
+        };
+      }
+    }
+    
+    logConversation(phoneNumber, finalMessage, 'user');
     
     let leadData = await vehicleDB.findByPhone(phoneNumber);
     
@@ -254,11 +287,15 @@ async function processUserMessage(phoneNumber, message) {
       });
     }
     
-    // Guardar el último mensaje del usuario para contexto
-    leadData.lastUserMessage = message;
+    // Guardar información sobre el tipo de mensaje
+    leadData.lastUserMessage = finalMessage;
+    leadData.lastMessageWasAudio = isAudioMessage;
     
     // Procesar mensaje con el motor conversacional
-    const response = await vehicleConversationEngine.processResponse(message, leadData);
+    const response = await vehicleConversationEngine.processResponse(finalMessage, leadData);
+    
+    // Determinar si responder con audio
+    response.shouldRespondWithAudio = isAudioMessage; // Responder en el mismo formato
     
     // Actualizar base de datos
     const updateData = {
@@ -327,7 +364,8 @@ async function processUserMessage(phoneNumber, message) {
         response: {
           type: 'error_natural',
           message: randomResponse,
-          waitingFor: 'consulta_general'
+          waitingFor: 'consulta_general',
+          shouldRespondWithAudio: false
         }
       };
     }
@@ -378,6 +416,10 @@ app.post('/webhook', async (req, res) => {
       
       const userMessage = data.body ? data.body.trim() : '';
       const phoneNumber = formatPhoneNumber(data.from);
+      const messageType = data.type;
+      const mediaUrl = data.media;
+      
+      const isAudioMessage = messageType === 'ptt' || messageType === 'audio';
       
       // Verificar si el número está autorizado
       if (!AUTHORIZED_NUMBERS.includes(phoneNumber)) {
@@ -386,7 +428,15 @@ app.post('/webhook', async (req, res) => {
         return;
       }
       
-      console.log(`📱 MENSAJE DE USUARIO AUTORIZADO ${phoneNumber}: ${userMessage}`);
+      if (isAudioMessage && mediaUrl) {
+        console.log(`🎙️ MENSAJE DE AUDIO de ${phoneNumber}: ${mediaUrl}`);
+      } else if (userMessage) {
+        console.log(`📱 MENSAJE DE TEXTO de ${phoneNumber}: ${userMessage}`);
+      } else {
+        console.log(`📭 MENSAJE VACÍO de ${phoneNumber}`);
+        res.status(200).json({ success: true });
+        return;
+      }
       
       // Verificar si hay una conversación activa
       let conversation = activeConversations.get(phoneNumber) || {
@@ -398,6 +448,8 @@ app.post('/webhook', async (req, res) => {
       // Agregar mensaje a la cola
       conversation.messages.push({
         text: userMessage,
+        isAudio: isAudioMessage,
+        mediaUrl: mediaUrl,
         timestamp: new Date()
       });
       
@@ -412,21 +464,22 @@ app.post('/webhook', async (req, res) => {
           try {
             const conv = activeConversations.get(phoneNumber);
             if (conv && conv.messages.length > 0) {
-              // Combinar todos los mensajes de texto
-              const combinedText = conv.messages
-                .filter(m => m.text && m.text.trim())
-                .map(m => m.text.trim())
-                .join(' ');
-              
+              // Tomar el último mensaje
+              const lastMessage = conv.messages[conv.messages.length - 1];
               conv.messages = []; // Limpiar mensajes procesados
               
               // Procesar mensaje
-              const result = await processUserMessage(phoneNumber, combinedText || 'mensaje vacío');
+              const result = await processUserMessage(phoneNumber, lastMessage.text, {
+                isAudioMessage: lastMessage.isAudio,
+                mediaUrl: lastMessage.mediaUrl
+              });
               
               if (result.success) {
+                const shouldUseAudio = result.response.shouldRespondWithAudio !== false;
+                
                 await sendWhatsAppMessage(phoneNumber, result.response.message, {
                   messageType: result.response.type === 'appointment_confirmed' ? 'appointment' : 'product_info',
-                  sendAsAudio: true
+                  sendAsAudio: shouldUseAudio
                 });
                 
                 if (result.response.type === 'appointment_confirmed') {
@@ -435,7 +488,7 @@ app.post('/webhook', async (req, res) => {
               } else {
                 await sendWhatsAppMessage(phoneNumber, result.message, {
                   messageType: 'error',
-                  sendAsAudio: true
+                  sendAsAudio: false // Errores siempre en texto
                 });
               }
               
@@ -460,13 +513,13 @@ app.post('/webhook', async (req, res) => {
               const randomResponse = naturalErrorResponses[Math.floor(Math.random() * naturalErrorResponses.length)];
               await sendWhatsAppMessage(phoneNumber, randomResponse, {
                 messageType: 'error',
-                sendAsAudio: true
+                sendAsAudio: false
               });
             } catch (sendError) {
               console.error('Error enviando mensaje de error:', sendError);
             }
           }
-        }, 2000);
+        }, 1000); // Reducir delay a 1 segundo
       }
     }
     
@@ -700,179 +753,346 @@ app.post('/admin/clean-gcs-audios', async (req, res) => {
   }
 });
 
+// Endpoint para ajustar configuración de voz
+app.post('/admin/voice-config', async (req, res) => {
+  try {
+    const { voiceId, stability, similarity_boost, style } = req.body;
+    
+    if (voiceId) {
+      elevenLabsService.setVoice(voiceId);
+    }
+    
+    if (stability !== undefined || similarity_boost !== undefined || style !== undefined) {
+      const newSettings = {};
+      if (stability !== undefined) newSettings.stability = stability;
+      if (similarity_boost !== undefined) newSettings.similarity_boost = similarity_boost;
+      if (style !== undefined) newSettings.style = style;
+      
+      elevenLabsService.updateVoiceSettings(newSettings);
+    }
+    
+    res.json({
+      success: true,
+      message: 'Configuración de voz actualizada',
+      currentVoice: elevenLabsService.defaultVoiceId,
+      currentSettings: elevenLabsService.voiceSettings
+   });
+ } catch (error) {
+   res.status(500).json({ error: error.message });
+ }
+});
+
+// Endpoint para probar calidad de voz
+app.post('/admin/test-voice', async (req, res) => {
+ try {
+   const { text, messageType } = req.body;
+   
+   const testText = text || "¡Hola! Esta es una prueba de la voz mejorada de Carlos. ¿Se escucha natural y menos robótica?";
+   const analyzedTone = elevenLabsService.analyzeMessageTone(testText);
+   const finalMessageType = messageType || analyzedTone;
+   
+   console.log(`🎭 Probando voz con tono: ${finalMessageType}`);
+   
+   const voiceConfig = elevenLabsService.getVoiceForMessageType(finalMessageType);
+   const result = await elevenLabsService.textToSpeech(testText, voiceConfig);
+   
+   if (result.success) {
+     // Programar eliminación después de 10 minutos
+     setTimeout(async () => {
+       try {
+         await gcsService.deleteAudio(result.fileName);
+       } catch (e) {
+         console.log('No se pudo eliminar archivo de prueba');
+       }
+     }, 10 * 60 * 1000);
+   }
+   
+   res.json({
+     success: result.success,
+     audioUrl: result.publicUrl,
+     detectedTone: analyzedTone,
+     usedTone: finalMessageType,
+     voiceSettings: voiceConfig.voiceSettings,
+     text: testText,
+     error: result.error
+   });
+ } catch (error) {
+   res.status(500).json({ error: error.message });
+ }
+});
+
+// Endpoint para obtener configuración actual de voz
+app.get('/admin/voice-config', (req, res) => {
+ try {
+   res.json({
+     success: true,
+     currentVoice: elevenLabsService.defaultVoiceId,
+     currentSettings: elevenLabsService.voiceSettings,
+     availableTones: [
+       'greeting',
+       'product_info', 
+       'appointment',
+       'error',
+       'enthusiasm',
+       'consultation'
+     ]
+   });
+ } catch (error) {
+   res.status(500).json({ error: error.message });
+ }
+});
+
 // Endpoint para ver conversaciones activas
 app.get('/conversations', (req, res) => {
-  const conversations = [];
-  activeConversations.forEach((conv, phone) => {
-    conversations.push({
-      phoneNumber: phone,
-      messagesInQueue: conv.messages.length,
-      isProcessing: conv.isProcessing,
-      lastActivity: conv.lastActivity,
-      authorized: AUTHORIZED_NUMBERS.includes(phone)
-    });
-  });
-  
-  res.json({ 
-    conversations, 
-    total: conversations.length,
-    authorizedNumbers: AUTHORIZED_NUMBERS
-  });
+ const conversations = [];
+ activeConversations.forEach((conv, phone) => {
+   conversations.push({
+     phoneNumber: phone,
+     messagesInQueue: conv.messages.length,
+     isProcessing: conv.isProcessing,
+     lastActivity: conv.lastActivity,
+     authorized: AUTHORIZED_NUMBERS.includes(phone)
+   });
+ });
+ 
+ res.json({ 
+   conversations, 
+   total: conversations.length,
+   authorizedNumbers: AUTHORIZED_NUMBERS
+ });
 });
 
 // Endpoint para estadísticas del sistema
 app.get('/stats', async (req, res) => {
-  try {
-    const leads = await vehicleDB.getAll();
-    const inventory = await inventoryService.getInventory();
-    
-    // Estadísticas de leads
-    const leadStats = {
-      total: leads.length,
-      activos: leads.filter(l => l.proceso?.status === 'activo').length,
-      conCita: leads.filter(l => l.proceso?.status === 'cita_agendada').length,
-      completados: leads.filter(l => l.proceso?.status === 'completado').length
-    };
-    
-    // Marcas más consultadas
-    const marcasConsultadas = {};
-    leads.forEach(lead => {
-      if (lead.interes?.marca_interes) {
-        const marca = lead.interes.marca_interes;
-        marcasConsultadas[marca] = (marcasConsultadas[marca] || 0) + 1;
-      }
-    });
-    
-    // Inventario stats
-    const inventoryStats = inventory.success ? {
-      totalVehicles: inventory.vehicles.length,
-      brands: inventory.brands.length,
-      lastUpdate: inventory.lastUpdate
-    } : { totalVehicles: 0, brands: 0, lastUpdate: null };
-    
-    res.json({
-      leads: leadStats,
-      inventory: inventoryStats,
-      marcasPopulares: marcasConsultadas,
-      conversacionesActivas: activeConversations.size,
-      timestamp: new Date().toISOString()
-    });
-  } catch (error) {
-    console.error('Error obteniendo estadísticas:', error);
-    res.status(500).json({ error: 'Error obteniendo estadísticas' });
-  }
+ try {
+   const leads = await vehicleDB.getAll();
+   const inventory = await inventoryService.getInventory();
+   
+   // Estadísticas de leads
+   const leadStats = {
+     total: leads.length,
+     activos: leads.filter(l => l.proceso?.status === 'activo').length,
+     conCita: leads.filter(l => l.proceso?.status === 'cita_agendada').length,
+     completados: leads.filter(l => l.proceso?.status === 'completado').length
+   };
+   
+   // Marcas más consultadas
+   const marcasConsultadas = {};
+   leads.forEach(lead => {
+     if (lead.interes?.marca_interes) {
+       const marca = lead.interes.marca_interes;
+       marcasConsultadas[marca] = (marcasConsultadas[marca] || 0) + 1;
+     }
+   });
+   
+   // Inventario stats
+   const inventoryStats = inventory.success ? {
+     totalVehicles: inventory.vehicles.length,
+     brands: inventory.brands.length,
+     lastUpdate: inventory.lastUpdate
+   } : { totalVehicles: 0, brands: 0, lastUpdate: null };
+   
+   // Estadísticas de mensajes de audio vs texto
+   const audioStats = {
+     totalConversations: leads.length,
+     conversationsWithAudio: leads.filter(l => 
+       l.proceso?.conversacion_historial?.some(conv => conv.was_audio)
+     ).length
+   };
+   
+   res.json({
+     leads: leadStats,
+     inventory: inventoryStats,
+     audio: audioStats,
+     marcasPopulares: marcasConsultadas,
+     conversacionesActivas: activeConversations.size,
+     timestamp: new Date().toISOString()
+   });
+ } catch (error) {
+   console.error('Error obteniendo estadísticas:', error);
+   res.status(500).json({ error: 'Error obteniendo estadísticas' });
+ }
 });
 
 // Health check
 app.get('/health', async (req, res) => {
-  try {
-    const dbHealth = await vehicleDB.healthCheck();
-    const inventoryHealth = await inventoryService.testConnection();
-    const gcsHealth = await gcsService.testConnection();
-    
-    const services = {
-      database: {
-        redis: dbHealth.redis,
-        memory: dbHealth.memory > 0,
-        total: dbHealth.total
-      },
-      inventory: {
-        configured: true,
-        loaded: inventoryHealth.success,
-        totalVehicles: inventoryHealth.totalVehicles || 0
-      },
-      email: {
-        configured: !!(process.env.RESEND_API_KEY && process.env.DOMAIN),
-        ready: !!(process.env.RESEND_API_KEY && process.env.DOMAIN)
-      },
-      claude: {
-        configured: !!process.env.CLAUDE_API_KEY,
-        ready: !!process.env.CLAUDE_API_KEY
-      },
-      ultramsg: {
-        configured: !!(process.env.ULTRAMSG_TOKEN && process.env.INSTANCE_ID),
-        ready: !!(process.env.ULTRAMSG_TOKEN && process.env.INSTANCE_ID)
-      },
-      elevenlabs: {
-        configured: !!process.env.ELEVENLABS_API_KEY,
-        ready: !!process.env.ELEVENLABS_API_KEY
-      },
-      gcs: {
-        configured: gcsHealth.success,
-        ready: gcsHealth.success,
-        bucket: gcsHealth.bucket || null,
-        folder: gcsHealth.folder || null
-      }
-    };
-    
-    const allServicesReady = Object.values(services).every(service => service.ready || service.loaded);
-    
-    res.json({ 
-      status: allServicesReady ? 'OK' : 'PARTIAL',
-      timestamp: new Date().toISOString(),
-      activeConversations: activeConversations.size,
-      totalLeads: dbHealth.total,
-      uptime: process.uptime(),
-      authorizedNumbers: AUTHORIZED_NUMBERS,
-      environment: process.env.NODE_ENV || 'development',
-      services: services,
-      version: '2.0-natural-gcs'
-    });
-  } catch (error) {
-    console.error('Error en health check:', error);
-    res.status(500).json({ 
-      status: 'ERROR',
-      error: 'Error en health check',
-      timestamp: new Date().toISOString()
-    });
-  }
+ try {
+   const dbHealth = await vehicleDB.healthCheck();
+   const inventoryHealth = await inventoryService.testConnection();
+   const gcsHealth = await gcsService.testConnection();
+   
+   const services = {
+     database: {
+       redis: dbHealth.redis,
+       memory: dbHealth.memory > 0,
+       total: dbHealth.total
+     },
+     inventory: {
+       configured: true,
+       loaded: inventoryHealth.success,
+       totalVehicles: inventoryHealth.totalVehicles || 0
+     },
+     email: {
+       configured: !!(process.env.RESEND_API_KEY && process.env.DOMAIN),
+       ready: !!(process.env.RESEND_API_KEY && process.env.DOMAIN)
+     },
+     claude: {
+       configured: !!process.env.CLAUDE_API_KEY,
+       ready: !!process.env.CLAUDE_API_KEY
+     },
+     ultramsg: {
+       configured: !!(process.env.ULTRAMSG_TOKEN && process.env.INSTANCE_ID),
+       ready: !!(process.env.ULTRAMSG_TOKEN && process.env.INSTANCE_ID)
+     },
+     elevenlabs: {
+       configured: !!process.env.ELEVENLABS_API_KEY,
+       ready: !!process.env.ELEVENLABS_API_KEY,
+       currentVoice: elevenLabsService.defaultVoiceId,
+       voiceSettings: elevenLabsService.voiceSettings
+     },
+     gcs: {
+       configured: gcsHealth.success,
+       ready: gcsHealth.success,
+       bucket: gcsHealth.bucket || null,
+       folder: gcsHealth.folder || null
+     },
+     transcription: {
+       configured: !!process.env.OPENAI_API_KEY,
+       ready: !!process.env.OPENAI_API_KEY
+     }
+   };
+   
+   const allServicesReady = Object.values(services).every(service => service.ready || service.loaded);
+   
+   res.json({ 
+     status: allServicesReady ? 'OK' : 'PARTIAL',
+     timestamp: new Date().toISOString(),
+     activeConversations: activeConversations.size,
+     totalLeads: dbHealth.total,
+     uptime: process.uptime(),
+     authorizedNumbers: AUTHORIZED_NUMBERS,
+     environment: process.env.NODE_ENV || 'development',
+     services: services,
+     version: '2.0-natural-voice-enhanced'
+   });
+ } catch (error) {
+   console.error('Error en health check:', error);
+   res.status(500).json({ 
+     status: 'ERROR',
+     error: 'Error en health check',
+     timestamp: new Date().toISOString()
+   });
+ }
+});
+
+// Endpoint para análisis de tono de mensajes
+app.post('/admin/analyze-tone', (req, res) => {
+ try {
+   const { message } = req.body;
+   
+   if (!message) {
+     return res.status(400).json({ error: 'Mensaje requerido' });
+   }
+   
+   const analyzedTone = elevenLabsService.analyzeMessageTone(message);
+   const voiceConfig = elevenLabsService.getVoiceForMessageType(analyzedTone);
+   
+   res.json({
+     success: true,
+     message: message,
+     detectedTone: analyzedTone,
+     voiceConfig: voiceConfig,
+     explanation: {
+       greeting: "Para saludos cálidos y amigables",
+       product_info: "Para información de productos balanceada", 
+       appointment: "Para confirmaciones de citas entusiastas",
+       error: "Para mensajes de error calmados",
+       enthusiasm: "Para momentos de emoción y entusiasmo",
+       consultation: "Para consultas técnicas profesionales"
+     }[analyzedTone] || "Configuración por defecto"
+   });
+ } catch (error) {
+   res.status(500).json({ error: error.message });
+ }
 });
 
 // Limpiar archivos antiguos de GCS cada 6 horas
 setInterval(async () => {
-  try {
-    await gcsService.cleanOldAudios(6); // Eliminar archivos mayores a 6 horas
-  } catch (error) {
-    console.error('Error limpiando archivos antiguos de GCS:', error);
-  }
+ try {
+   await gcsService.cleanOldAudios(6); // Eliminar archivos mayores a 6 horas
+ } catch (error) {
+   console.error('Error limpiando archivos antiguos de GCS:', error);
+ }
 }, 6 * 60 * 60 * 1000);
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log('\n' + '='.repeat(60));
-  console.log('🚗 BOT CONCESIONARIO INICIADO EXITOSAMENTE');
-  console.log('='.repeat(60));
-  console.log(`🌐 Servidor: http://localhost:${PORT}`);
-  console.log(`🔐 Números autorizados: ${AUTHORIZED_NUMBERS.join(', ')}`);
-  console.log('');
-  console.log('📋 ENDPOINTS PRINCIPALES:');
-  console.log(`🚀 Iniciar conversación: POST ${PORT}/start-conversation`);
-  console.log(`💬 Webhook WhatsApp: POST ${PORT}/webhook`);
-  console.log(`📊 Leads: GET ${PORT}/leads`);
-  console.log(`🚗 Inventario: GET ${PORT}/inventory`);
-  console.log(`🏥 Health Check: GET ${PORT}/health`);
-  console.log(`📈 Estadísticas: GET ${PORT}/stats`);
-  console.log('');
-  console.log('🔧 ENDPOINTS ADMINISTRATIVOS:');
-  console.log(`🗑️ Limpiar datos: DELETE ${PORT}/admin/clear-data/{phone}`);
-  console.log(`🧪 Test inventario: GET ${PORT}/admin/test-inventory`);
-  console.log(`☁️ Test GCS: GET ${PORT}/admin/test-gcs`);
-  console.log(`📁 Listar audios GCS: GET ${PORT}/admin/gcs-audios`);
-  console.log(`🧹 Limpiar audios GCS: POST ${PORT}/admin/clean-gcs-audios`);
-  console.log('');
-  console.log('🎯 BOT PARA COMPRA-VENTA DE VEHÍCULOS v2.0-GCS');
-  console.log('💡 Funcionalidades:');
-  console.log('   🗣️ Conversaciones súper naturales con Carlos');
-  console.log('   📋 Consulta de inventario desde Google Sheets');
-  console.log('   🤖 IA conversacional avanzada con Claude');
-  console.log('   📅 Agendamiento de citas intuitivo');
-  console.log('   📧 Notificaciones automáticas por email');
-  console.log('   📊 Registro de leads en Google Sheets');
-  console.log('   💬 Manejo inteligente de errores');
-  console.log('   🧠 Memoria conversacional');
-  console.log('   🎙️ Mensajes de voz con ElevenLabs');
-  console.log('   ☁️ Almacenamiento de audio en Google Cloud Storage');
-  console.log('='.repeat(60));
-  console.log('🎉 ¡Listo para conversaciones naturales con audio en la nube!');
-  console.log('='.repeat(60) + '\n');
+ console.log('\n' + '='.repeat(60));
+ console.log('🚗 BOT CONCESIONARIO INICIADO EXITOSAMENTE');
+ console.log('='.repeat(60));
+ console.log(`🌐 Servidor: http://localhost:${PORT}`);
+ console.log(`🔐 Números autorizados: ${AUTHORIZED_NUMBERS.join(', ')}`);
+ console.log('');
+ console.log('📋 ENDPOINTS PRINCIPALES:');
+ console.log(`🚀 Iniciar conversación: POST ${PORT}/start-conversation`);
+ console.log(`💬 Webhook WhatsApp: POST ${PORT}/webhook`);
+ console.log(`📊 Leads: GET ${PORT}/leads`);
+ console.log(`🚗 Inventario: GET ${PORT}/inventory`);
+ console.log(`🏥 Health Check: GET ${PORT}/health`);
+ console.log(`📈 Estadísticas: GET ${PORT}/stats`);
+ console.log('');
+ console.log('🔧 ENDPOINTS ADMINISTRATIVOS:');
+ console.log(`🗑️ Limpiar datos: DELETE ${PORT}/admin/clear-data/{phone}`);
+ console.log(`🧪 Test inventario: GET ${PORT}/admin/test-inventory`);
+ console.log(`☁️ Test GCS: GET ${PORT}/admin/test-gcs`);
+ console.log(`📁 Listar audios GCS: GET ${PORT}/admin/gcs-audios`);
+ console.log(`🧹 Limpiar audios GCS: POST ${PORT}/admin/clean-gcs-audios`);
+ console.log('');
+ console.log('🎙️ ENDPOINTS DE VOZ:');
+ console.log(`🎛️ Configurar voz: POST ${PORT}/admin/voice-config`);
+ console.log(`📊 Ver configuración: GET ${PORT}/admin/voice-config`);
+ console.log(`🎤 Probar voz: POST ${PORT}/admin/test-voice`);
+ console.log(`🎭 Analizar tono: POST ${PORT}/admin/analyze-tone`);
+ console.log('');
+ console.log('🎯 BOT PARA COMPRA-VENTA DE VEHÍCULOS v2.0-VOICE-ENHANCED');
+ console.log('💡 Funcionalidades:');
+ console.log('   🗣️ Conversaciones súper naturales con Carlos');
+ console.log('   📋 Consulta de inventario desde Google Sheets');
+ console.log('   🤖 IA conversacional avanzada con Claude');
+ console.log('   📅 Agendamiento de citas intuitivo');
+ console.log('   📧 Notificaciones automáticas por email');
+ console.log('   📊 Registro de leads en Google Sheets');
+ console.log('   💬 Manejo inteligente de errores');
+ console.log('   🧠 Memoria conversacional');
+ console.log('   🎙️ Mensajes de voz naturales con ElevenLabs');
+ console.log('   ☁️ Almacenamiento de audio en Google Cloud Storage');
+ console.log('   🎤 Transcripción de audios con Whisper');
+ console.log('   🔄 Detección automática de formato de mensaje');
+ console.log('   🎭 Análisis de tono automático para voz natural');
+ console.log('   🎛️ Configuración dinámica de parámetros de voz');
+ console.log('   🔊 Respuesta en mismo formato (audio por audio)');
+ console.log('='.repeat(60));
+ console.log('🎉 ¡Listo para conversaciones naturales con audio bidireccional mejorado!');
+ console.log('='.repeat(60) + '\n');
+ 
+ // Mostrar configuración actual de voz
+ console.log('🎤 CONFIGURACIÓN ACTUAL DE VOZ:');
+ console.log(`   Voice ID: ${elevenLabsService.defaultVoiceId}`);
+ console.log(`   Stability: ${elevenLabsService.voiceSettings.stability}`);
+ console.log(`   Similarity Boost: ${elevenLabsService.voiceSettings.similarity_boost}`);
+ console.log(`   Style: ${elevenLabsService.voiceSettings.style}`);
+ console.log(`   Speaker Boost: ${elevenLabsService.voiceSettings.use_speaker_boost}`);
+ console.log('');
+ console.log('📝 PARA MEJORAR LA VOZ:');
+ console.log(`   POST ${PORT}/admin/voice-config`);
+ console.log('   Body: { "stability": 0.6, "similarity_boost": 0.7, "style": 0.4 }');
+ console.log('');
+ console.log('🎭 TONOS DISPONIBLES:');
+ console.log('   • greeting - Saludos cálidos');
+ console.log('   • product_info - Información balanceada');
+ console.log('   • appointment - Confirmaciones entusiastas');
+ console.log('   • error - Mensajes de error calmados');
+ console.log('   • enthusiasm - Momentos de emoción');
+ console.log('   • consultation - Consultas técnicas');
+ console.log('='.repeat(60) + '\n');
 });
